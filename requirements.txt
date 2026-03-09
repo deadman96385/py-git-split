@@ -1,0 +1,7 @@
+anthropic
+click
+questionary
+python-dotenv
+rich
+tree-sitter
+tree-sitter-languages
