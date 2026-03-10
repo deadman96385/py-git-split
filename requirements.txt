@@ -3,5 +3,5 @@ click
 questionary
 python-dotenv
 rich
-tree-sitter
-tree-sitter-languages
+voyageai
+numpy
