@@ -492,11 +492,11 @@ def _fallback_subject_for_group(files, added, removed, fhs=None):
 
 
 _MSG_BATCH_SIZE = 20          # groups per Claude request
-_MSG_MAX_FILES = 15           # file paths per group entry
-_MSG_MAX_PREVIEW_HUNKS = 6    # hunks to include in preview per group
-_MSG_MAX_PREVIEW_LINES = 12   # diff lines per preview hunk
-_MSG_MAX_LINE_CHARS = 200     # truncate long diff lines
-_MSG_MAX_CONTEXT_CHARS = 1500 # truncate the original/bundle-context string
+_MSG_MAX_FILES = 12           # file paths per group entry
+_MSG_MAX_PREVIEW_HUNKS = 4    # hunks to include in preview per group
+_MSG_MAX_PREVIEW_LINES = 8    # diff lines per preview hunk
+_MSG_MAX_LINE_CHARS = 180     # truncate long diff lines
+_MSG_MAX_CONTEXT_CHARS = 800  # truncate the original/bundle-context string
 _MSG_INTER_BATCH_DELAY = 4    # seconds between batches
 
 
@@ -593,9 +593,9 @@ def ai_generate_messages(groups, hunks, api_key, original=None, body_mode="auto"
     status("AI message generation done")
     return groups
 
-_GROUPS_MAX_PREVIEW_LINES = 10
-_GROUPS_MAX_LINE_CHARS = 150
-_GROUPS_MAX_CONTEXT_CHARS = 1500
+_GROUPS_MAX_PREVIEW_LINES = 6
+_GROUPS_MAX_LINE_CHARS = 140
+_GROUPS_MAX_CONTEXT_CHARS = 800
 
 _MERGE_BATCH_SIZE = 150   # max low-confidence groups per merge-review batch
 
