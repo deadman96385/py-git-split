@@ -140,7 +140,7 @@ def _merge_bundles(b1: Bundle, b2: Bundle) -> Bundle:
 def refine_bundles(
     bundles: list[Bundle],
     voyage_api_key: Optional[str],
-    merge_threshold: float = 0.75,
+    merge_threshold: float = 0.85,
 ) -> list[Bundle]:
     """For low-confidence bundles in the same component, merge similar ones.
 
