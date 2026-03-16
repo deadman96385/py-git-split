@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from bundling_constants import DEFAULT_MAX_ANCHOR_BREADTH
+from bundling_constants import DEFAULT_MAX_ANCHOR_BREADTH, DEFAULT_DEEP_ROOT_THRESHOLD
 from repo_analysis import RepoAnalysis, RepoMode
 
 
@@ -30,8 +30,8 @@ BSP_COMPONENTS = [
 ]
 
 # Density threshold: a depth-2 subsystem with more files than this is a candidate
-# for deeper splitting.  Matches MAX_ANCHOR_BREADTH in candidate_bundling.py.
-_DEEP_ROOT_THRESHOLD = DEFAULT_MAX_ANCHOR_BREADTH
+# for deeper splitting.
+_DEEP_ROOT_THRESHOLD = DEFAULT_DEEP_ROOT_THRESHOLD
 _DEEP_ROOT_MAX_DEPTH = 6
 
 _DTS_RE = re.compile(r'arch/[^/]+/boot/dts/.*\.(?:dtsi?|main_dts)$')
@@ -58,6 +58,8 @@ class PartitionedHunk:
     defconfig_board: Optional[str]
     # Raw hunk lines for downstream extraction
     lines: list[str] = field(default_factory=list)
+    bsp_subsystem: Optional[str] = None
+    hunk_header: str = ""
 
 
 def _classify_component_bsp(file_path: str) -> tuple[str, str]:
@@ -190,6 +192,20 @@ def _defconfig_board(file_path: str) -> Optional[str]:
     return name
 
 
+def _bsp_subsystem(file_path: str) -> Optional[str]:
+    """Extract a 2-component subsystem label for BSP (non-kernel) files.
+
+    E.g. vendor/foo/drivers/bar.c → "vendor/foo/drivers"
+         hardware/interfaces/power/aidl/default/foo.cpp → "hardware/interfaces/power"
+    """
+    parts = file_path.replace("\\", "/").split("/")
+    if len(parts) >= 3:
+        return "/".join(parts[:3])
+    if len(parts) >= 2:
+        return "/".join(parts[:2])
+    return None
+
+
 def classify_hunk(
     hunk,
     file_headers: dict,
@@ -251,6 +267,8 @@ def classify_hunk(
         dts_board_prefix=dts_bp,
         defconfig_board=dc_board,
         lines=lines,
+        bsp_subsystem=_bsp_subsystem(fp) if component != "kernel" else None,
+        hunk_header=getattr(hunk, 'header', ''),
     )
 
 
