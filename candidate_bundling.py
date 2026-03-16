@@ -30,7 +30,7 @@ BUNDLE_SCORE_WEIGHTS = {
     "shared_dts_board":          4.0,
     "shared_defconfig":          4.0,
     "shared_hal_package":        4.0,
-    "shared_component":          2.0,
+    "shared_component":          0.5,  # Reduced from 2.0: component veto already enforces exclusivity
     "shared_path_tokens":        1.5,
     "same_new_file_group":       2.0,
     # Co-change anchor locking
@@ -413,6 +413,22 @@ def score_affinity(
             # Wiring-only bundle: discourage using wiring as a bridge
             score += weights.get("wiring_no_payload_penalty", BUNDLE_SCORE_WEIGHTS["wiring_no_payload_penalty"])
 
+    # --- Feature 4: Intra-file hunk coherence ---
+    # Penalize bundling unrelated hunks from the same file. Reward symbol coherence.
+    hunk_file = hunk.file_path
+    bundle_same_file = [h for h in bundle.hunks if h.file_path == hunk_file]
+    if bundle_same_file:
+        # Check if the new hunk shares symbols with the same-file hunks already in bundle
+        shared_with_same_file = set(hunk.weighted_symbols.keys()) & {
+            sym for h in bundle_same_file for sym in h.weighted_symbols.keys()
+        }
+        if shared_with_same_file:
+            # Hunks from same file share symbols: reward coherence
+            score += weights.get("intra_file_symbol_coherence", 2.0) * min(len(shared_with_same_file), 3)
+        else:
+            # Hunks from same file share NO symbols: penalize unrelated bundling
+            score += weights.get("intra_file_unrelated_penalty", -2.0)
+
     return score
 
 
@@ -646,6 +662,75 @@ def create_anchor_bundles(
 
 
 # ---------------------------------------------------------------------------
+# Post-bundle coherence splitting
+# ---------------------------------------------------------------------------
+
+def split_incoherent_bundles(bundles: list[Bundle]) -> list[Bundle]:
+    """Split bundles that contain orphaned hunks with low coherence to the majority.
+
+    A hunk is orphaned if it shares neither symbols nor a majority directory with
+    the rest of the bundle. This catches cases where the greedy algorithm attached
+    weakly-related hunks that should have been separate commits.
+    """
+    from collections import Counter
+
+    result = []
+    for bundle in bundles:
+        if len(bundle.hunks) <= 2:
+            # Keep small bundles intact — splitting on 2 hunks can produce false orphans
+            result.append(bundle)
+            continue
+
+        # Build symbol and directory universes for the bundle
+        all_syms: dict[str, int] = defaultdict(int)
+        for h in bundle.hunks:
+            for sym in h.weighted_symbols.keys():
+                all_syms[sym] += 1
+
+        # Symbols appearing in 2+ hunks are "shared" (majority signal)
+        majority_syms = {s for s, c in all_syms.items() if c > 1}
+
+        # Directories appearing in 2+ hunks are "majority dirs"
+        dir_counter = Counter(str(Path(h.file_path).parent) for h in bundle.hunks)
+        majority_dirs = {d for d, cnt in dir_counter.items() if cnt > 1}
+
+        # Classify hunks
+        core, orphans = [], []
+        for h in bundle.hunks:
+            h_dir = str(Path(h.file_path).parent)
+            has_sym_overlap = bool(set(h.weighted_symbols.keys()) & majority_syms)
+            in_majority_dir = h_dir in majority_dirs
+
+            if has_sym_overlap or in_majority_dir:
+                core.append(h)
+            else:
+                orphans.append(h)
+
+        # If we have both core and orphans, split them
+        if orphans and core:
+            # Keep the core bundle
+            bundle.hunks = core
+            result.append(bundle)
+
+            # Create singleton bundles for orphans (each gets its own commit)
+            for orphan in orphans:
+                orphan_bundle = Bundle(
+                    bundle_id=_make_bundle_id(),
+                    hunks=[orphan],
+                    confidence="low",
+                    preliminary_label="",
+                    component=orphan.component,
+                )
+                orphan_bundle.confidence_score = 0.0
+                result.append(orphan_bundle)
+        else:
+            # No split needed
+            result.append(bundle)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Bundle building (greedy algorithm)
 # ---------------------------------------------------------------------------
 
@@ -686,6 +771,17 @@ def build_bundles(
 
     # Greedy attachment: for each unassigned hunk, find best bundle
     unassigned = [h for h in features if h.hunk_id not in assigned]
+
+    # Sort unassigned hunks by descending maximum affinity score before greedy pass.
+    # This ensures high-confidence attachments happen first, leaving ambiguous hunks
+    # to be decided after anchor bundles are more fully populated.
+    def max_affinity(hunk: HunkFeatures) -> float:
+        return max(
+            (score_affinity(hunk, bundle, weights, cochange_index=cochange_index)
+             for bundle in anchors),
+            default=0.0
+        )
+    unassigned.sort(key=max_affinity, reverse=True)
 
     # Iterate until no more attachments possible
     changed = True
@@ -745,6 +841,17 @@ def build_bundles(
         if len(bundle.hunks) == 1:
             bundle.confidence = "low"
         elif bundle.confidence_score > 0 and bundle.confidence_score < attachment_threshold:
+            bundle.confidence = "low"
+
+    # Post-bundle coherence pass: split out orphaned hunks that don't fit the bundle majority.
+    # This is a safety net for cases where the greedy algorithm attached weakly-related
+    # hunks that should have been separate commits.
+    bundles = split_incoherent_bundles(bundles)
+
+    # Re-assign preliminary labels and confidence for split bundles
+    for bundle in bundles:
+        bundle.preliminary_label = assign_preliminary_label(bundle)
+        if len(bundle.hunks) == 1:
             bundle.confidence = "low"
 
     return bundles

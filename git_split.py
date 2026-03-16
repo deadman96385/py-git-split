@@ -314,10 +314,10 @@ def preflight_patch_check(raw_diff: str, parent_ref: str) -> None:
 
 def get_diff(staged=True):
     if staged:
-        return run_git_diff("diff", "--cached", "--unified=3").stdout
-    return run_git_diff("diff", "--unified=3").stdout
+        return run_git_diff("diff", "--cached", "--unified=10").stdout
+    return run_git_diff("diff", "--unified=10").stdout
 
-def get_commit_diff(h): return run_git_diff("show","--unified=3",h).stdout
+def get_commit_diff(h): return run_git_diff("show","--unified=10",h).stdout
 
 def get_commit_msg(h): return run_git("log","--format=%B","-n","1",h).stdout.strip()
 

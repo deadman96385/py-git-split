@@ -66,11 +66,25 @@ COMMON_KERNEL_SYMBOLS = {
 
 
 def symbol_weight(symbol: str, occurrence_count: int) -> float:
-    """Compute symbol weight. Returns 0.0 for common/stop-list symbols."""
+    """Compute symbol weight. Returns 0.0 for common/stop-list symbols.
+
+    Key insight: symbols appearing in 2-3 hunks are the strongest co-change signal
+    and should be weighted *highest*, not lowest. A symbol shared by multiple hunks
+    indicates those hunks should be grouped together.
+
+    Weight curve:
+    - 1 occurrence: 1.0 (unique, good signal)
+    - 2-3 occurrences: 2.0 (prime co-grouping signal)
+    - 4+ occurrences: 1.0 / log(1 + count) (dilutes as count grows)
+    """
     if symbol in COMMON_KERNEL_SYMBOLS:
         return 0.0
     if len(symbol) < 3:
         return 0.0
+    # Reward symbols appearing in 2-3 hunks (strong co-change signal)
+    if occurrence_count in (2, 3):
+        return 2.0
+    # For rare symbols (1 occurrence) or common ones (4+), use log scaling
     return 1.0 / math.log(1 + occurrence_count)
 
 
@@ -226,12 +240,18 @@ def _count_occurrences(partitioned_hunks: list[PartitionedHunk]) -> dict[str, in
 
 
 def _extract_symbols_from_hunk(lines: list[str]) -> list[str]:
-    """Extract symbol names from added lines of a hunk."""
+    """Extract symbol names from added lines of a hunk.
+
+    Includes function definitions, type definitions, macro definitions, and function calls.
+    Call-site symbols are weighted lower but provide strong co-change signals.
+    """
     added_body = "\n".join(l for l in lines if l.startswith("+"))
     syms: list[str] = []
     syms.extend(FUNC_DEF.findall(added_body))
     syms.extend(TYPE_DEF.findall(added_body))
     syms.extend(MACRO_DEF.findall(added_body))
+    # Add function calls (with marker so they can be weighted differently if needed)
+    syms.extend(FUNC_CALL.findall(added_body))
     return syms
 
 
