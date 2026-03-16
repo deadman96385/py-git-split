@@ -223,6 +223,8 @@ class HunkFeatures:
     removed_lines: int
     net_lines: int
     raw_lines: list[str] = field(default_factory=list)
+    bsp_subsystem: Optional[str] = None
+    hunk_header: str = ""
 
 
 def _count_occurrences(partitioned_hunks: list[PartitionedHunk]) -> dict[str, int]:
@@ -319,6 +321,8 @@ def extract_features(
                 removed_lines=removed_lines,
                 net_lines=net_lines,
                 raw_lines=list(ph.lines),
+                bsp_subsystem=ph.bsp_subsystem,
+                hunk_header=ph.hunk_header,
             )
         )
 

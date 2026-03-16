@@ -30,6 +30,7 @@ BUNDLE_SCORE_WEIGHTS = {
     "shared_dts_board":          4.0,
     "shared_defconfig":          4.0,
     "shared_hal_package":        4.0,
+    "shared_bsp_subsystem":      4.0,   # matching 2-3 component BSP path prefix
     "shared_component":          0.5,  # Reduced from 2.0: component veto already enforces exclusivity
     "shared_path_tokens":        1.5,
     "same_new_file_group":       2.0,
@@ -127,6 +128,13 @@ class Bundle:
         lines.append(f"  Net lines: +{added_lines} | Hunk count: {len(self.hunks)}")
         if kconfig_str:
             lines.append(f"  Kconfig pair: {kconfig_str}")
+
+        # Hunk locations (@@-headers)
+        headers = [h.hunk_header[:80] for h in self.hunks if h.hunk_header][:3]
+        if headers:
+            lines.append("  Locations:")
+            for hdr in headers:
+                lines.append(f"    {hdr}")
 
         return "\n".join(lines)
 
@@ -295,6 +303,12 @@ def score_affinity(
         bundle_subsystems = {h.kernel_subsystem for h in bundle.hunks if h.kernel_subsystem}
         if hunk.kernel_subsystem in bundle_subsystems:
             score += weights.get("shared_subsystem", BUNDLE_SCORE_WEIGHTS["shared_subsystem"])
+
+    # Shared BSP subsystem (non-kernel components)
+    if hunk.bsp_subsystem:
+        bundle_bsp = {h.bsp_subsystem for h in bundle.hunks if h.bsp_subsystem}
+        if hunk.bsp_subsystem in bundle_bsp:
+            score += weights.get("shared_bsp_subsystem", BUNDLE_SCORE_WEIGHTS["shared_bsp_subsystem"])
 
     # Shared DTS board
     if hunk.is_dts and hunk.dts_board_prefix:
