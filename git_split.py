@@ -9,7 +9,7 @@ import click
 from repo_analysis import analyze_repo, RepoAnalysis, RepoMode
 from structural_partitioning import partition, PartitionResult
 from feature_extraction import extract_features
-from candidate_bundling import build_bundles, generate_export_report, Bundle
+from candidate_bundling import build_bundles, generate_export_report, Bundle, MAX_ANCHOR_BREADTH
 from embedding_refinement import refine_bundles
 
 try:
@@ -493,9 +493,9 @@ def _fallback_subject_for_group(files, added, removed, fhs=None):
 
 _MSG_BATCH_SIZE = 20          # groups per Claude request
 _MSG_MAX_FILES = 15           # file paths per group entry
-_MSG_MAX_PREVIEW_HUNKS = 3    # hunks to include in preview per group
-_MSG_MAX_PREVIEW_LINES = 4    # diff lines per preview hunk
-_MSG_MAX_LINE_CHARS = 120     # truncate long diff lines
+_MSG_MAX_PREVIEW_HUNKS = 6    # hunks to include in preview per group
+_MSG_MAX_PREVIEW_LINES = 12   # diff lines per preview hunk
+_MSG_MAX_LINE_CHARS = 200     # truncate long diff lines
 _MSG_MAX_CONTEXT_CHARS = 1500 # truncate the original/bundle-context string
 _MSG_INTER_BATCH_DELAY = 4    # seconds between batches
 
@@ -593,8 +593,8 @@ def ai_generate_messages(groups, hunks, api_key, original=None, body_mode="auto"
     status("AI message generation done")
     return groups
 
-_GROUPS_MAX_PREVIEW_LINES = 6
-_GROUPS_MAX_LINE_CHARS = 80
+_GROUPS_MAX_PREVIEW_LINES = 10
+_GROUPS_MAX_LINE_CHARS = 150
 _GROUPS_MAX_CONTEXT_CHARS = 1500
 
 _MERGE_BATCH_SIZE = 150   # max low-confidence groups per merge-review batch
@@ -625,7 +625,10 @@ def _ai_merge_groups(groups: list, bundle_map: dict, api_key: str, context: str 
         "The following groups were produced by a structural kernel diff analyser with LOW confidence.\n"
         "Identify groups that are clearly about the same topic/feature and should be merged into one commit.\n"
         "Do NOT merge groups that belong to different subsystems or features, even if they are close in the tree.\n"
-        "Leave single-file or narrow groups as-is unless there is an obvious match.\n\n"
+        "Leave single-file or narrow groups as-is unless there is an obvious match.\n"
+        "If a group's Subsystem field lists more than 3 unrelated top-level subsystems "
+        "(e.g. net/, drivers/acpi, drivers/crypto), treat it as a candidate for further splitting "
+        "rather than merging — do NOT merge it with other groups.\n\n"
         "Groups:\n" +
         "\n\n".join(f'[{r["id"]}]\n{r["summary"]}' for r in rows) +
         '\n\nReturn JSON only: {"merges": [["id_a", "id_b"], ["id_c", "id_d", "id_e"]]}\n'
@@ -1048,6 +1051,43 @@ def execute_rebase(full_hash,groups,hunks,fhs,expected_tree,dry=False):
                 except OSError:
                     pass
 
+def _parse_deep_subsystem_roots(raw: Optional[str]) -> dict[str, int]:
+    """Parse --deep-subsystem-roots value into a dict.
+
+    Format: 'drivers/foo/drv:4,kernel/bar:3'
+    """
+    if not raw:
+        return {}
+    result: dict[str, int] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ":" not in entry:
+            raise click.BadParameter(
+                f"Invalid deep subsystem root {entry!r}; expected prefix:depth"
+            )
+        prefix, _, depth_str = entry.rpartition(":")
+        prefix = prefix.strip().strip("/")
+        if not prefix:
+            raise click.BadParameter(
+                f"Invalid deep subsystem root {entry!r}; prefix must be non-empty"
+            )
+        try:
+            depth = int(depth_str.strip())
+        except ValueError:
+            raise click.BadParameter(
+                f"Invalid deep subsystem root {entry!r}; depth must be an integer"
+            ) from None
+        if depth < 3:
+            raise click.BadParameter(
+                f"Invalid deep subsystem root {entry!r}; depth must be at least 3"
+                " (the default is 2 components, so an override must go deeper)"
+            )
+        result[prefix] = depth
+    return result
+
+
 def _bundles_to_groups(bundles, hunks):
     """Convert Bundle objects to CommitGroup objects for the existing pipeline."""
     hmap = {h.id: h for h in hunks}
@@ -1156,10 +1196,11 @@ def cli(ctx,api_key,voyage_api_key):
 @click.option("--export-format", type=click.Choice(["md","json"]), default="md", show_default=True, help="Format for --export-bundles")
 @click.option("--export-file", default=None, help="Write export report to this file instead of stdout")
 @click.option("--attachment-threshold", default=4.0, show_default=True, type=float, help="Minimum affinity score for hunk attachment")
-@click.option("--max-anchor-breadth", default=20, show_default=True, type=int, help="Maximum new-file count per anchor bundle before splitting")
+@click.option("--max-anchor-breadth", default=MAX_ANCHOR_BREADTH, show_default=True, type=int, help="Maximum new-file count per anchor bundle before splitting")
 @click.option("--skip-components", default=None, help="Comma-separated list of components to skip")
+@click.option("--deep-subsystem-roots", default=None, help="Extra deep subsystem roots, format: 'drivers/foo/drv:4,kernel/bar:3'")
 @click.pass_context
-def split(ctx,staged,dry_run,message_body,kernel_root,no_release_context,export_bundles,export_format,export_file,attachment_threshold,max_anchor_breadth,skip_components):
+def split(ctx,staged,dry_run,message_body,kernel_root,no_release_context,export_bundles,export_format,export_file,attachment_threshold,max_anchor_breadth,skip_components,deep_subsystem_roots):
     assert_repo(); assert_clean_state()
     api=ctx.obj.get("api_key"); voyage_api=ctx.obj.get("voyage_api_key")
     diff_mode = "staged" if staged else "unstaged"
@@ -1182,7 +1223,8 @@ def split(ctx,staged,dry_run,message_body,kernel_root,no_release_context,export_
     if skip_components:
         skip_set = {c.strip() for c in skip_components.split(",") if c.strip()}
 
-    partition_result = partition(base_hunks, fhs, analysis)
+    extra_deep_roots = _parse_deep_subsystem_roots(deep_subsystem_roots)
+    partition_result = partition(base_hunks, fhs, analysis, deep_roots=extra_deep_roots)
     if skip_set:
         partition_result.hunks = [h for h in partition_result.hunks if h.component not in skip_set]
 
@@ -1219,9 +1261,10 @@ def split(ctx,staged,dry_run,message_body,kernel_root,no_release_context,export_
 @click.option("--no-release-context", is_flag=True, default=False, help="Skip release context extraction from HEAD commit")
 @click.option("--skip-components", default=None, help="Comma-separated list of components to skip")
 @click.option("--attachment-threshold", default=4.0, show_default=True, type=float, help="Minimum affinity score for hunk attachment")
-@click.option("--max-anchor-breadth", default=20, show_default=True, type=int, help="Maximum new-file count per anchor bundle before splitting")
+@click.option("--max-anchor-breadth", default=MAX_ANCHOR_BREADTH, show_default=True, type=int, help="Maximum new-file count per anchor bundle before splitting")
+@click.option("--deep-subsystem-roots", default=None, help="Extra deep subsystem roots, format: 'drivers/foo/drv:4,kernel/bar:3'")
 @click.pass_context
-def rebase(ctx,commit_hash,dry_run,message_body,kernel_root,no_release_context,skip_components,attachment_threshold,max_anchor_breadth):
+def rebase(ctx,commit_hash,dry_run,message_body,kernel_root,no_release_context,skip_components,attachment_threshold,max_anchor_breadth,deep_subsystem_roots):
     assert_repo(); assert_clean_state()
     api=ctx.obj.get("api_key"); voyage_api=ctx.obj.get("voyage_api_key")
     if not commit_hash: commit_hash="HEAD"
@@ -1257,7 +1300,8 @@ def rebase(ctx,commit_hash,dry_run,message_body,kernel_root,no_release_context,s
     if skip_components:
         skip_set = {c.strip() for c in skip_components.split(",") if c.strip()}
 
-    partition_result = partition(base_hunks, fhs, analysis)
+    extra_deep_roots = _parse_deep_subsystem_roots(deep_subsystem_roots)
+    partition_result = partition(base_hunks, fhs, analysis, deep_roots=extra_deep_roots)
     if skip_set:
         partition_result.hunks = [h for h in partition_result.hunks if h.component not in skip_set]
 

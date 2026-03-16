@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from bundling_constants import DEFAULT_MAX_ANCHOR_BREADTH
 from repo_analysis import ReleaseContext
 from feature_extraction import HunkFeatures
 
@@ -46,7 +47,7 @@ BUNDLE_SCORE_WEIGHTS = {
 }
 
 ATTACHMENT_THRESHOLD = 4
-MAX_ANCHOR_BREADTH = 20
+MAX_ANCHOR_BREADTH = DEFAULT_MAX_ANCHOR_BREADTH
 
 # Hard-veto file-extension patterns
 _GENERATED_RE = re.compile(r'\.(pb\.h|pb\.cc|autogen\.[^/]+)$')
@@ -423,6 +424,21 @@ def _make_bundle_id() -> str:
     return str(uuid.uuid4())[:8]
 
 
+def _subgroup_key_for_anchor(hunk: HunkFeatures, group_key: str) -> str:
+    """Split oversized anchors by the next directory below the group root.
+
+    Falls back to the full parent path to avoid collisions between unrelated
+    directories that happen to share the same leaf name.
+    """
+    parent = Path(hunk.file_path).parent
+    if hunk.kernel_subsystem:
+        parent_parts = parent.parts
+        root_parts = Path(group_key).parts
+        if parent_parts[:len(root_parts)] == root_parts and len(parent_parts) > len(root_parts):
+            return "/".join(parent_parts[:len(root_parts) + 1])
+    return str(parent).replace("\\", "/")
+
+
 def create_anchor_bundles(
     features: list[HunkFeatures],
     partition_result,
@@ -431,8 +447,16 @@ def create_anchor_bundles(
     """Create anchor seed bundles from structural groups."""
     anchors: list[Bundle] = []
 
-    # Group new-file hunks by subsystem (kernel) or parent dir (simple streams)
-    new_file_hunks = [h for h in features if h.is_new_file]
+    # Group new-file hunks by subsystem (kernel) or parent dir (simple streams).
+    # Exclude file types that have dedicated anchor sections later (c/d/e) so the
+    # deduplication in build_bundles does not strip them from those sections.
+    # DTS board groups (c), defconfig groups (d), and HAL interface groups (e)
+    # each consume their own hunk types; letting section (a) claim them first
+    # would leave those specialised sections completely empty.
+    new_file_hunks = [
+        h for h in features
+        if h.is_new_file and not h.is_dts and not h.is_defconfig and not h.is_hal_interface
+    ]
 
     # a. New-file subsystem groups
     kernel_new: dict[str, list[HunkFeatures]] = defaultdict(list)
@@ -450,13 +474,11 @@ def create_anchor_bundles(
             if not hunks:
                 continue
             component = hunks[0].component
-            # Cap anchor breadth by splitting large groups on filename prefix
+            # Cap anchor breadth by splitting large groups on a stable subdirectory key
             if len(hunks) > max_anchor_breadth:
                 subgroups: dict[str, list[HunkFeatures]] = defaultdict(list)
                 for h in hunks:
-                    stem = Path(h.file_path).stem
-                    # Use first 3 chars of stem as sub-prefix
-                    subkey = stem[:3] if len(stem) >= 3 else stem
+                    subkey = _subgroup_key_for_anchor(h, key)
                     subgroups[subkey].append(h)
                 for subhunks in subgroups.values():
                     b = Bundle(
@@ -499,13 +521,19 @@ def create_anchor_bundles(
                 for sym in syms:
                     sym_to_makefile[sym] = h
 
-    # Pair kconfig + makefile hunks that share a CONFIG symbol
+    # Pair kconfig + makefile hunks that share a CONFIG symbol.
+    # Deduplicate by (kconfig_hunk_id, makefile_hunk_id) so that pairs sharing
+    # multiple symbols don't produce duplicate bundles.
     paired_kconfig_ids: set[str] = set()
+    seen_pairs: set[tuple[str, str]] = set()
     for sym, kh in sym_to_kconfig.items():
         mh = sym_to_makefile.get(sym)
         if mh is None or kh.hunk_id == mh.hunk_id:
             continue
-        # These two belong together; create or extend an anchor
+        pair_key = (kh.hunk_id, mh.hunk_id)
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
         combined = [kh, mh]
         component = kh.component
         b = Bundle(
@@ -519,11 +547,48 @@ def create_anchor_bundles(
         paired_kconfig_ids.add(kh.hunk_id)
         paired_kconfig_ids.add(mh.hunk_id)
 
-    # c. DTS board groups
+    # Fallback: group unpaired Kconfigs/Makefiles by parent directory.
+    # Handles routing Kconfigs / source-only Kconfigs where symbol extraction yields nothing.
+    unpaired_wiring = [
+        h for h in features
+        if (h.is_kconfig or h.is_makefile)
+        and h.hunk_id not in paired_kconfig_ids
+    ]
+    wiring_by_dir: dict[str, list[HunkFeatures]] = defaultdict(list)
+    for h in unpaired_wiring:
+        wiring_by_dir[str(Path(h.file_path).parent)].append(h)
+    for dir_path, dir_hunks in wiring_by_dir.items():
+        # Only anchor if both a Kconfig and a Makefile are present in the same dir
+        has_kconfig = any(h.is_kconfig for h in dir_hunks)
+        has_makefile = any(h.is_makefile for h in dir_hunks)
+        if has_kconfig and has_makefile:
+            component = dir_hunks[0].component
+            b = Bundle(
+                bundle_id=_make_bundle_id(),
+                hunks=list(dir_hunks),
+                confidence="high",
+                preliminary_label="",
+                component=component,
+            )
+            anchors.append(b)
+            for h in dir_hunks:
+                paired_kconfig_ids.add(h.hunk_id)
+
+    # c. DTS board groups — one anchor per chip/platform prefix (e.g. "m7322",
+    #    "c2p").  Overlays and ramdisk variants share a prefix with their base
+    #    DTS so they land in the same commit (dependency-aware grouping).
+    #    DTS files that carry no board prefix (shared DTSIs, wiring-only files)
+    #    are collected into a single "misc dts" anchor so they don't scatter as
+    #    isolated singletons.
     dts_by_board: dict[str, list[HunkFeatures]] = defaultdict(list)
+    dts_misc: list[HunkFeatures] = []
     for h in features:
-        if h.is_dts and h.dts_board_prefix:
+        if not h.is_dts:
+            continue
+        if h.dts_board_prefix:
             dts_by_board[h.dts_board_prefix].append(h)
+        else:
+            dts_misc.append(h)
     for board, hunks in dts_by_board.items():
         component = hunks[0].component
         b = Bundle(
@@ -532,6 +597,15 @@ def create_anchor_bundles(
             confidence="high",
             preliminary_label="",
             component=component,
+        )
+        anchors.append(b)
+    if dts_misc:
+        b = Bundle(
+            bundle_id=_make_bundle_id(),
+            hunks=dts_misc,
+            confidence="low",   # no specific platform — let AI label it
+            preliminary_label="",
+            component=dts_misc[0].component,
         )
         anchors.append(b)
 
@@ -657,9 +731,20 @@ def build_bundles(
     for bundle in bundles:
         bundle.preliminary_label = assign_preliminary_label(bundle)
 
-    # Mark low-confidence bundles: singletons or score below threshold
+    # Mark low-confidence bundles.
+    # Rules:
+    #  - Singleton bundles are always low-confidence.
+    #  - Multi-hunk bundles are low-confidence only if they had actual attachments
+    #    that scored below threshold (confidence_score > 0 means at least one hunk
+    #    was attached).  Anchor bundles that had NO attachments at all keep their
+    #    original "high" confidence — a score of 0.0 means "no external hunks
+    #    attached", not "poor cohesion".  Marking them low would send every
+    #    anchor bundle to the AI merge step, causing large subsystems to be
+    #    collapsed back into a single mega-commit.
     for bundle in bundles:
-        if len(bundle.hunks) == 1 or bundle.confidence_score < attachment_threshold:
+        if len(bundle.hunks) == 1:
+            bundle.confidence = "low"
+        elif bundle.confidence_score > 0 and bundle.confidence_score < attachment_threshold:
             bundle.confidence = "low"
 
     return bundles

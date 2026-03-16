@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from bundling_constants import DEFAULT_MAX_ANCHOR_BREADTH
 from repo_analysis import RepoAnalysis, RepoMode
 
 
@@ -27,8 +29,13 @@ BSP_COMPONENTS = [
     ("system/",     "system",        "simple"),
 ]
 
-_DTS_RE = re.compile(r'arch/[^/]+/boot/dts/.*\.dtsi?$')
-_KCONFIG_RE = re.compile(r'(?:^|/)Kconfig(?:\.[^/]*)?$')
+# Density threshold: a depth-2 subsystem with more files than this is a candidate
+# for deeper splitting.  Matches MAX_ANCHOR_BREADTH in candidate_bundling.py.
+_DEEP_ROOT_THRESHOLD = DEFAULT_MAX_ANCHOR_BREADTH
+_DEEP_ROOT_MAX_DEPTH = 6
+
+_DTS_RE = re.compile(r'arch/[^/]+/boot/dts/.*\.(?:dtsi?|main_dts)$')
+_KCONFIG_RE = re.compile(r'(?:^|/)Kconfig(?:\.[A-Za-z][^/]*)?$')
 _MAKEFILE_RE = re.compile(r'(?:^|/)(?:Makefile|Kbuild)$')
 _DEFCONFIG_RE = re.compile(r'(?:arch/[^/]+/configs/[^/]+_defconfig|[^/]+_defconfig)$')
 _HAL_EXT_RE = re.compile(r'\.hal$')
@@ -76,10 +83,81 @@ def _rel_to_kernel(file_path: str, kernel_root: str) -> str:
     return file_path
 
 
-def _kernel_subsystem(file_path: str, kernel_root: str) -> Optional[str]:
-    """Top-2 path components below kernel_root (e.g. 'drivers/usb')."""
+def _discover_deep_roots(
+    file_paths: list[str],
+    kernel_root: str,
+    threshold: int = _DEEP_ROOT_THRESHOLD,
+    max_depth: int = _DEEP_ROOT_MAX_DEPTH,
+) -> dict[str, int]:
+    """Auto-discover subsystem prefixes that need more than 2 path components.
+
+    For every depth-2 prefix (e.g. 'drivers/usb') that has more than *threshold*
+    files in the diff, find the minimum depth at which the files split into at
+    least two distinct sub-groups.  This is purely data-driven — no vendor-specific
+    knowledge required.
+
+    Returns a dict of {prefix: depth} suitable for use in _kernel_subsystem().
+    """
+    # Group files by their depth-2 prefix
+    by_prefix: dict[str, list[str]] = defaultdict(list)
+    for fp in file_paths:
+        rel = _rel_to_kernel(fp, kernel_root)
+        parts = rel.split("/")
+        if len(parts) >= 2:
+            by_prefix[f"{parts[0]}/{parts[1]}"].append(fp)
+
+    deep_roots: dict[str, int] = {}
+    for prefix, fps in by_prefix.items():
+        if len(fps) <= threshold:
+            continue
+        # Walk deeper until the files split into at least two sub-groups that
+        # each contain more than one file (prevents a single stray file from
+        # triggering deep splitting for the entire prefix).
+        for depth in range(3, max_depth + 1):
+            sub_groups: dict[str, int] = defaultdict(int)
+            for fp in fps:
+                rel = _rel_to_kernel(fp, kernel_root)
+                parts = list(Path(rel).parent.parts)
+                if len(parts) < depth:
+                    continue
+                key = "/".join(parts[:depth])
+                sub_groups[key] += 1
+            meaningful = [k for k, cnt in sub_groups.items() if cnt > 1]
+            if len(meaningful) > 1:
+                deep_roots[prefix] = depth
+                break
+
+    return deep_roots
+
+
+def _kernel_subsystem(
+    file_path: str,
+    kernel_root: str,
+    deep_roots: Optional[dict[str, int]] = None,
+) -> Optional[str]:
+    """Top-N path components below kernel_root (e.g. 'drivers/usb').
+
+    Defaults to top-2, but uses top-3 for include/linux/ paths, and uses
+    deeper depths for any prefix present in *deep_roots* (auto-discovered or
+    provided via CLI).
+    """
     rel = _rel_to_kernel(file_path, kernel_root)
     parts = rel.split("/")
+    roots = deep_roots or {}
+    for prefix, depth in roots.items():
+        prefix_parts = prefix.split("/")
+        # `len(parts) > depth` means the file is nested deeper than the target
+        # depth (i.e. it has at least depth+1 components including the filename).
+        # Files that sit *at* the subsystem root (exactly `depth` components)
+        # fall through to the default top-2 logic — they belong to the parent
+        # subsystem, not a sub-group.
+        if parts[:len(prefix_parts)] == prefix_parts and len(parts) > depth:
+            return "/".join(parts[:depth])
+    # include/linux/ → top-3 when the third component is a subdirectory (no extension).
+    # Flat headers like include/linux/fscrypt.h stay at depth-2.
+    if parts[0:2] == ["include", "linux"] and len(parts) >= 3 and "." not in parts[2]:
+        return f"include/linux/{parts[2]}"
+    # Default: top-2
     if len(parts) >= 2:
         return f"{parts[0]}/{parts[1]}"
     if len(parts) == 1 and parts[0]:
@@ -88,14 +166,20 @@ def _kernel_subsystem(file_path: str, kernel_root: str) -> Optional[str]:
 
 
 def _dts_board_prefix(file_path: str) -> Optional[str]:
-    """Extract board prefix from DTS filename stem (first 2 dash-parts)."""
+    """Extract board prefix from DTS filename stem.
+
+    Upstream convention: hyphen-separated → first two parts (e.g. 'rockchip-rk3399').
+    MStar/vendor convention: underscore-separated → first part (e.g. 'm7322').
+    """
     stem = Path(file_path).stem
-    parts = stem.split("-")
-    if len(parts) >= 2:
-        return f"{parts[0]}-{parts[1]}"
-    if parts:
-        return parts[0]
-    return None
+    hyphen_parts = stem.split("-")
+    if len(hyphen_parts) >= 2:
+        return f"{hyphen_parts[0]}-{hyphen_parts[1]}"
+    # Vendor underscore convention (e.g. m7322_an, m7622_ramdisk)
+    underscore_parts = stem.split("_")
+    if len(underscore_parts) >= 2:
+        return underscore_parts[0]
+    return stem if stem else None
 
 
 def _defconfig_board(file_path: str) -> Optional[str]:
@@ -106,7 +190,13 @@ def _defconfig_board(file_path: str) -> Optional[str]:
     return name
 
 
-def classify_hunk(hunk, file_headers: dict, kernel_root: str, mode: RepoMode) -> PartitionedHunk:
+def classify_hunk(
+    hunk,
+    file_headers: dict,
+    kernel_root: str,
+    mode: RepoMode,
+    deep_roots: Optional[dict[str, int]] = None,
+) -> PartitionedHunk:
     """Classify a hunk into its structural partition."""
     fp: str = hunk.filepath
     lines: list[str] = list(hunk.lines)
@@ -125,7 +215,7 @@ def classify_hunk(hunk, file_headers: dict, kernel_root: str, mode: RepoMode) ->
         is_new_file = any("new file" in line for line in fh.lines)
 
     # File-type flags
-    is_dts = bool(_DTS_RE.search(fp) or fp.endswith(".dtsi") or fp.endswith(".dts"))
+    is_dts = bool(_DTS_RE.search(fp) or fp.endswith(".dtsi") or fp.endswith(".dts") or fp.endswith(".main_dts"))
     is_kconfig = bool(_KCONFIG_RE.search(fp))
     is_makefile = bool(_MAKEFILE_RE.search(fp))
     is_defconfig = bool(_DEFCONFIG_RE.search(fp))
@@ -138,7 +228,7 @@ def classify_hunk(hunk, file_headers: dict, kernel_root: str, mode: RepoMode) ->
     # kernel_subsystem: for kernel-component files only
     ks: Optional[str] = None
     if component == "kernel" or mode == RepoMode.KERNEL_ONLY:
-        ks = _kernel_subsystem(fp, kernel_root or "")
+        ks = _kernel_subsystem(fp, kernel_root or "", deep_roots=deep_roots)
 
     # dts_board_prefix
     dts_bp: Optional[str] = _dts_board_prefix(fp) if is_dts else None
@@ -182,8 +272,17 @@ class PartitionResult:
     makefile_symbols: dict[str, list[str]]  # hunk_id → referenced CONFIG_ symbols
 
 
-def partition(hunks, file_headers: dict, analysis: RepoAnalysis) -> PartitionResult:
-    """Partition all hunks into structural components."""
+def partition(
+    hunks,
+    file_headers: dict,
+    analysis: RepoAnalysis,
+    deep_roots: Optional[dict[str, int]] = None,
+) -> PartitionResult:
+    """Partition all hunks into structural components.
+
+    deep_roots: optional extra entries to merge with auto-discovered deep roots
+                (e.g. from the --deep-subsystem-roots CLI flag).
+    """
     partitioned: list[PartitionedHunk] = []
     skipped: list[tuple[str, str]] = []
     kconfig_symbols: dict[str, list[str]] = {}
@@ -192,8 +291,19 @@ def partition(hunks, file_headers: dict, analysis: RepoAnalysis) -> PartitionRes
     kernel_root = analysis.kernel_root or ""
     mode = analysis.mode
 
+    # Auto-discover which kernel subsystems are dense enough to warrant deeper
+    # splitting, then merge with any explicit overrides from the caller.
+    # Only kernel-component paths contribute — BSP paths (vendor/, hardware/, …)
+    # are handled by component classification, not kernel_subsystem().
+    kernel_file_paths = [
+        hunk.filepath for hunk in hunks
+        if not any(hunk.filepath.startswith(p) for p, _, _ in BSP_COMPONENTS)
+    ]
+    discovered = _discover_deep_roots(kernel_file_paths, kernel_root)
+    effective_deep_roots = {**discovered, **(deep_roots or {})}
+
     for hunk in hunks:
-        ph = classify_hunk(hunk, file_headers, kernel_root, mode)
+        ph = classify_hunk(hunk, file_headers, kernel_root, mode, deep_roots=effective_deep_roots)
 
         # Extract kconfig / makefile symbols from hunk body
         body = "\n".join(ph.lines)
