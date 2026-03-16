@@ -631,8 +631,9 @@ def _ai_merge_groups(groups: list, bundle_map: dict, api_key: str, context: str 
         "rather than merging — do NOT merge it with other groups.\n\n"
         "Groups:\n" +
         "\n\n".join(f'[{r["id"]}]\n{r["summary"]}' for r in rows) +
-        '\n\nReturn JSON only: {"merges": [["id_a", "id_b"], ["id_c", "id_d", "id_e"]]}\n'
-        "Only include groups that should be merged. Omit groups that should stay as-is."
+        '\n\nReturn JSON only: {"merges": [["id_a", "id_b"], ...], "splits": [{"id": "id_x", "reason": "..."}]}\n'
+        "Only include groups that should be merged. In splits, flag any single group that clearly contains "
+        "unrelated features — do NOT add those groups to merges. Omit both keys if nothing applies."
     )
 
     result, _ = _api_call_with_retry(
@@ -657,6 +658,20 @@ def _ai_merge_groups(groups: list, bundle_map: dict, api_key: str, context: str 
         return groups
 
     merges: list[list[str]] = data.get("merges", [])
+    splits: list[dict] = data.get("splits", [])
+    excluded_from_merge: set[str] = set()
+
+    # Process splits first: flag groups that should be split (mark as low confidence)
+    for entry in splits:
+        gid = entry.get("id", "")
+        reason = entry.get("reason", "no reason given")
+        if gid and gid in {g.id for g in groups}:
+            b = bundle_map.get(gid)
+            if b:
+                b.confidence = "low"
+            excluded_from_merge.add(gid)
+            status(f"merge review: flagged [{gid}] for splitting: {reason}")
+
     if not merges:
         return groups
 
@@ -664,7 +679,7 @@ def _ai_merge_groups(groups: list, bundle_map: dict, api_key: str, context: str 
     id_to_group = {g.id: g for g in groups}
     absorbed: set[str] = set()
     for merge_set in merges:
-        valid = [gid for gid in merge_set if gid in id_to_group and gid not in absorbed]
+        valid = [gid for gid in merge_set if gid in id_to_group and gid not in absorbed and gid not in excluded_from_merge]
         if len(valid) < 2:
             continue
         primary_id = valid[0]
@@ -1106,6 +1121,80 @@ def _bundles_to_groups(bundles, hunks):
     return groups
 
 
+def _ai_sanity_check_large_bundles(groups: list, bundle_map: dict, api_key: str, context: str = "") -> None:
+    """LLM sanity check on high-confidence bundles with 10+ hunks. Modifies bundle_map in place."""
+    _require_anthropic(api_key)
+
+    # Filter qualifying bundles: high-confidence, 10+ hunks
+    qualifying = [
+        g for g in groups
+        if bundle_map.get(g.id)
+        and bundle_map[g.id].confidence == "high"
+        and len(bundle_map[g.id].hunks) >= 10
+    ]
+
+    if len(qualifying) < 3:
+        return
+
+    # Cap at 20 bundles for cost/sanity
+    _MAX_COHERENCE_CHECK_BUNDLES = 20
+    if len(qualifying) > _MAX_COHERENCE_CHECK_BUNDLES:
+        status(f"sanity check: {len(qualifying)} qualifying bundles, capping at {_MAX_COHERENCE_CHECK_BUNDLES}")
+        qualifying = qualifying[:_MAX_COHERENCE_CHECK_BUNDLES]
+
+    # Build prompt with summaries
+    rows = []
+    for g in qualifying:
+        b = bundle_map.get(g.id)
+        if b:
+            rows.append({"id": g.id, "summary": b.summary()})
+
+    if not rows:
+        return
+
+    prompt = (
+        (context[:_GROUPS_MAX_CONTEXT_CHARS] + "\n\n" if context else "") +
+        "Review these large high-confidence groups for internal coherence.\n"
+        "Flag any that appear to contain hunks from multiple unrelated features, different board targets, "
+        "or subsystems with no shared symbols.\n"
+        "These groups passed automatic bundling but may need human review.\n\n"
+        "Groups:\n" +
+        "\n\n".join(f'[{r["id"]}]\n{r["summary"]}' for r in rows) +
+        '\n\nReturn JSON only: {"suspicious": ["id_a", "id_b"]}\n'
+        "Omit the key if no groups are suspicious."
+    )
+
+    try:
+        c = anthropic.Anthropic(api_key=api_key)
+        result, _ = _api_call_with_retry(
+            lambda: c.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=2048,
+                system="Return JSON only.",
+                messages=[{"role": "user", "content": prompt}],
+            ),
+            label="sanity check",
+        )
+        raw = result.content[0].text.strip()
+        raw = re.sub(r"^```[a-z]*\n?", "", raw); raw = re.sub(r"\n?```$", "", raw)
+        s = raw.find("{"); e = raw.rfind("}")
+        if s == -1 or e <= s:
+            return
+        try:
+            data = json.loads(raw[s:e+1])
+        except json.JSONDecodeError:
+            return
+
+        suspicious: list[str] = data.get("suspicious", [])
+        for gid in suspicious:
+            b = bundle_map.get(gid)
+            if b:
+                b.confidence = "low"
+                status(f"sanity check: downgraded high-conf [{gid}]")
+    except Exception as e:
+        status(f"sanity check failed ({e}), skipping")
+
+
 def enhanced_llm_arbitration(groups, bundles, hunks, api_key, fhs, analysis, body_mode):
     """Refine grouping for low-confidence bundles, then generate commit messages for all groups.
 
@@ -1131,9 +1220,17 @@ def enhanced_llm_arbitration(groups, bundles, hunks, api_key, fhs, analysis, bod
         d_str = rc.date or "unknown"
         release_preamble = f"This diff represents vendor release {v_str} dated {d_str}. "
 
-    # --- Stage 1: merge review for low-confidence groups ---
+    # --- Pre-stage: sanity check large high-confidence bundles ---
+    try:
+        _ai_sanity_check_large_bundles(groups, bundle_map, api_key, release_preamble)
+    except Exception as e:
+        status(f"sanity check failed ({e}), skipping")
+
+    # Re-partition (some high-conf bundles may have been downgraded)
     low_conf = [g for g in groups if bundle_map.get(g.id) and bundle_map[g.id].confidence == "low"]
     high_conf = [g for g in groups if g not in low_conf]
+
+    # --- Stage 1: merge review for low-confidence groups ---
 
     if low_conf and api_key:
         status(f"merge review: {len(low_conf)} low-confidence groups across {(len(low_conf) + _MERGE_BATCH_SIZE - 1) // _MERGE_BATCH_SIZE} batch(es)")
