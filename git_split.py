@@ -1001,9 +1001,17 @@ def execute_rebase(full_hash,groups,hunks,fhs,expected_tree,dry=False):
 
     script=["#!/usr/bin/env bash","set -e","git reset HEAD^"]
     for mode, i, msg, body, path in plan:
+        # Validate message is non-empty
+        if not msg or not isinstance(msg, str):
+            status(f"warning: group {i} has empty/invalid message, using fallback")
+            msg = "chore: import changes"
+        msg = msg.strip()
+        if not msg:
+            msg = "chore: import changes"
+
         mf = tempfile.NamedTemporaryFile("w", suffix=f"_git_split_{i}.msg", delete=False, dir=tempfile.gettempdir())
         try:
-            mf.write(msg.strip() + "\n")
+            mf.write(msg + "\n")
             if body:
                 mf.write("\n" + body.strip() + "\n")
             msg_path = mf.name
@@ -1048,6 +1056,14 @@ def execute_rebase(full_hash,groups,hunks,fhs,expected_tree,dry=False):
     with open(sp, "w") as f:
         f.write("\n".join(script)+"\n")
     os.chmod(sp,0o755)
+
+    # Verify script was written completely
+    script_line_count = len(script)
+    expected_script_lines = 3 + (len(plan) * 2) + 15  # header + (apply+commit per step) + footer
+    if script_line_count < expected_script_lines - 5:
+        status(f"warning: script may be incomplete ({script_line_count} lines, expected ~{expected_script_lines})")
+    else:
+        status(f"script written: {script_line_count} lines, {len(plan)} groups")
 
     print(f"Run:\n  git rebase -i {parent}\n  # change pick {full_hash[:7]} -> edit {full_hash[:7]}\n  bash {sp}")
     if dry:
@@ -1187,10 +1203,14 @@ def _ai_sanity_check_large_bundles(groups: list, bundle_map: dict, api_key: str,
 
         suspicious: list[str] = data.get("suspicious", [])
         for gid in suspicious:
+            if not gid or not isinstance(gid, str):
+                continue  # Skip malformed/empty IDs
             b = bundle_map.get(gid)
             if b:
                 b.confidence = "low"
                 status(f"sanity check: downgraded high-conf [{gid}]")
+            else:
+                status(f"sanity check: warning — suspicious ID not found: {gid}")
     except Exception as e:
         status(f"sanity check failed ({e}), skipping")
 
