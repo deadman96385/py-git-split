@@ -32,6 +32,7 @@ except Exception:
     Table = None
 
 console = Console() if Console else None
+ANTHROPIC_MODEL = os.environ.get("GIT_SPLIT_ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 @dataclass
 class Hunk:
@@ -554,7 +555,7 @@ def ai_generate_messages(groups, hunks, api_key, original=None, body_mode="auto"
         }
         _req = req  # capture for lambda
         r, waited = _api_call_with_retry(
-            lambda: c.messages.create(model="claude-sonnet-4-20250514", max_tokens=8192, system="Return JSON only.", messages=[{"role": "user", "content": json.dumps(_req)}]),
+            lambda: c.messages.create(model=ANTHROPIC_MODEL, max_tokens=8192, system="Return JSON only.", messages=[{"role": "user", "content": json.dumps(_req)}]),
             label=f"message generation batch {batch_idx + 1}/{total_batches}",
         )
         raw=r.content[0].text.strip()
@@ -638,7 +639,7 @@ def _ai_merge_groups(groups: list, bundle_map: dict, api_key: str, context: str 
 
     result, _ = _api_call_with_retry(
         lambda: c.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=ANTHROPIC_MODEL,
             max_tokens=4096,
             system="Return JSON only.",
             messages=[{"role": "user", "content": prompt}],
@@ -715,7 +716,7 @@ def ai_groups(hunks,api_key,msg=None):
     }
     _req = req
     r, _waited = _api_call_with_retry(
-        lambda: c.messages.create(model="claude-sonnet-4-20250514", max_tokens=8192, system="Return JSON only.", messages=[{"role": "user", "content": json.dumps(_req)}]),
+        lambda: c.messages.create(model=ANTHROPIC_MODEL, max_tokens=8192, system="Return JSON only.", messages=[{"role": "user", "content": json.dumps(_req)}]),
         label="AI grouping",
     )
     raw=r.content[0].text.strip()
@@ -1184,7 +1185,7 @@ def _ai_sanity_check_large_bundles(groups: list, bundle_map: dict, api_key: str,
         c = anthropic.Anthropic(api_key=api_key)
         result, _ = _api_call_with_retry(
             lambda: c.messages.create(
-                model="claude-sonnet-4-20250514",
+                model=ANTHROPIC_MODEL,
                 max_tokens=2048,
                 system="Return JSON only.",
                 messages=[{"role": "user", "content": prompt}],
@@ -1229,6 +1230,17 @@ def enhanced_llm_arbitration(groups, bundles, hunks, api_key, fhs, analysis, bod
     """
     if not api_key or not anthropic:
         return groups
+
+    if _env_flag("GIT_SPLIT_FULL_AI_GROUPING", default=False):
+        status(f"full AI grouping enabled: regrouping {len(hunks)} hunks")
+        regrouped = ai_groups(hunks, api_key)
+        return ai_generate_messages(
+            regrouped,
+            hunks,
+            api_key,
+            body_mode=body_mode,
+            fhs=fhs,
+        )
 
     bundle_map = {b.bundle_id: b for b in bundles}
 
